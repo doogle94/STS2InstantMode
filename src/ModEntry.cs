@@ -26,8 +26,20 @@ public static class ModEntry
     public const float FastSpeed = 10.0f;
     public static bool IsEnabled = true;
     
-    // Flag to track transitions without needing expensive StackTrace checks
-    public static bool IsTransitionActive = false;
+    public static long TransitionStartedAt = 0;
+    public const long TransitionExpiryMs = 2000;
+
+    public static bool IsInTransition()
+    {
+        if (TransitionStartedAt == 0) return false;
+        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        if (now - TransitionStartedAt > TransitionExpiryMs)
+        {
+            TransitionStartedAt = 0;
+            return false;
+        }
+        return true;
+    }
 
     private static string GetLogPath()
     {
@@ -63,7 +75,7 @@ public static class ModEntry
         if (_initialized) return;
         _initialized = true;
 
-        LogDebug("v1.3.4 - STABLE FLAG-BASED TRANSITIONS (StackTrace Removed)");
+        LogDebug("v1.3.6 - FORENSIC DEBUGGING START...");
 
         try {
             var harmony = new Harmony("com.instantmode.mod");
@@ -75,7 +87,7 @@ public static class ModEntry
             manager.Name = "InstantModeSpeedManager";
             NGame.Instance?.CallDeferred(Node.MethodName.AddChild, manager);
 
-            LogDebug("Init complete. Monitoring transitions via flags.");
+            LogDebug("Init complete. Monitoring State, Cmds, and Tweens.");
         } catch (Exception ex) {
             LogDebug($"FATAL INIT ERROR: {ex}");
         }
@@ -86,12 +98,10 @@ public static class ModEntry
         try {
             var saveManagerType = AccessTools.TypeByName("MegaCrit.Sts2.Core.Saves.SaveManager");
             var prefsSaveProp = AccessTools.Property(saveManagerType, "PrefsSave");
-            var prefsSaveType = prefsSaveProp.PropertyType;
-            var fastModeProp = AccessTools.Property(prefsSaveType, "FastMode");
+            var fastModeProp = AccessTools.Property(prefsSaveProp.PropertyType, "FastMode");
             var getter = fastModeProp.GetGetMethod();
             var prefix = AccessTools.Method(typeof(FastModeGetterPatch), nameof(FastModeGetterPatch.Prefix));
             harmony.Patch(getter, new HarmonyMethod(prefix));
-            LogDebug("FastMode property patched.");
         } catch (Exception ex) {
             LogDebug($"Could not patch FastMode getter: {ex}");
         }
@@ -102,7 +112,7 @@ public static class ModEntry
         try {
             IsEnabled = !IsEnabled;
             LogDebug($"Toggle -> {IsEnabled}");
-            
+            TransitionStartedAt = 0;
             if (NGame.Instance != null)
             {
                 NGame.Instance.AddChild(NFullscreenTextVfx.Create(IsEnabled ? "Instant Mode: ON" : "Instant Mode: OFF"));
@@ -115,29 +125,43 @@ public static class ModEntry
 
 public static class FastModeGetterPatch
 {
+    [ThreadStatic]
+    private static bool _isInsideGetter = false;
+
     public static bool Prefix(ref FastModeType __result)
     {
-        if (ModEntry.IsEnabled)
-        {
-            // Very fast check - no StackTrace overhead
-            if (ModEntry.IsTransitionActive)
+        if (!ModEntry.IsEnabled) return true;
+        if (_isInsideGetter) return true;
+
+        _isInsideGetter = true;
+        try {
+            if (ModEntry.IsInTransition())
             {
                 __result = FastModeType.Fast;
                 return false;
             }
-
             __result = FastModeType.Instant;
             return false;
+        } finally {
+            _isInsideGetter = false;
         }
-        return true;
     }
 }
 
 public partial class SpeedManager : Node
 {
+    private int _heartbeatCounter = 0;
+
     public override void _Process(double delta)
     {
         try {
+            _heartbeatCounter++;
+            if (_heartbeatCounter >= 120) { // Every 2 seconds
+                long mem = (long)Performance.GetMonitor(Performance.Monitor.MemoryStatic);
+                // ModEntry.LogDebug($"[HEARTBEAT] Frame: {Engine.GetFramesDrawn()}, Mem: {mem / 1024 / 1024}MB, InTransition: {ModEntry.IsInTransition()}");
+                _heartbeatCounter = 0;
+            }
+
             if (!ModEntry.IsEnabled)
             {
                 if (Engine.TimeScale != 1.0) Engine.TimeScale = 1.0;
@@ -159,22 +183,11 @@ public static class TransitionPatch
     [HarmonyPrefix]
     static void FadeOutPrefix(ref float time)
     {
-        ModEntry.IsTransitionActive = true;
+        ModEntry.TransitionStartedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         if (ModEntry.IsEnabled)
         {
-            ModEntry.LogDebug($"[TRACE] FadeOut Started. Time set to 1.0 (0.1s real)");
+            ModEntry.LogDebug($"[STATE] Transition START (FadeOut). Dur: {time}");
             time = 1.0f; 
-        }
-    }
-
-    [HarmonyPatch(nameof(NTransition.FadeIn))]
-    [HarmonyPrefix]
-    static void FadeInPrefix(ref float time)
-    {
-        ModEntry.IsTransitionActive = true;
-        if (ModEntry.IsEnabled)
-        {
-            time = 1.0f;
         }
     }
 
@@ -182,24 +195,8 @@ public static class TransitionPatch
     [HarmonyPostfix]
     static void FadeInPostfix()
     {
-        ModEntry.IsTransitionActive = false;
-        ModEntry.LogDebug("[TRACE] Transition Finished (FadeIn).");
-    }
-
-    [HarmonyPatch(nameof(NTransition.RoomFadeOut))]
-    [HarmonyPrefix]
-    static void RoomFadeOutPrefix()
-    {
-        ModEntry.IsTransitionActive = true;
-        ModEntry.LogDebug("[TRACE] RoomFadeOut Started.");
-    }
-
-    [HarmonyPatch(nameof(NTransition.RoomFadeIn))]
-    [HarmonyPostfix]
-    static void RoomFadeInPostfix()
-    {
-        ModEntry.IsTransitionActive = false;
-        ModEntry.LogDebug("[TRACE] RoomFadeIn Finished.");
+        ModEntry.TransitionStartedAt = 0;
+        ModEntry.LogDebug("[STATE] Transition END (FadeIn).");
     }
 }
 
@@ -208,23 +205,36 @@ public static class CmdWaitPatch
 {
     [HarmonyPatch(nameof(Cmd.Wait), new Type[] { typeof(float), typeof(bool) })]
     [HarmonyPrefix]
-    static void Prefix1(ref float seconds)
+    static void WaitPrefix(ref float seconds)
     {
         if (ModEntry.IsEnabled && seconds > 0f)
         {
-            // Safety: Use 0.001 instead of 0 to prevent infinite loops in game scripts
-            seconds = 0.001f;
+            // ModEntry.LogDebug($"[CMD] Wait bypassing: {seconds}s");
+            seconds = 0.01f;
         }
     }
 
-    [HarmonyPatch(nameof(Cmd.Wait), new Type[] { typeof(float), typeof(CancellationToken), typeof(bool) })]
+    [HarmonyPatch(nameof(Cmd.CustomScaledWait))]
     [HarmonyPrefix]
-    static void Prefix2(ref float seconds)
+    static void CustomWaitPrefix(ref float fastSeconds, ref float standardSeconds)
     {
-        if (ModEntry.IsEnabled && seconds > 0f)
+        if (ModEntry.IsEnabled)
         {
-            seconds = 0.001f;
+            // ModEntry.LogDebug($"[CMD] CustomWait bypassing: {fastSeconds}s / {standardSeconds}s");
+            fastSeconds = 0.01f;
+            standardSeconds = 0.01f;
         }
+    }
+}
+
+[HarmonyPatch(typeof(NGame))]
+public static class NGamePatch
+{
+    [HarmonyPatch("LoadRun")]
+    [HarmonyPrefix]
+    static void LoadRunPrefix()
+    {
+        ModEntry.LogDebug("[STATE] NGame.LoadRun called - Major transition starting.");
     }
 }
 
@@ -255,6 +265,8 @@ public static class InputPatch
                     ModEntry.Toggle();
                 }
             }
-        } catch {}
+        } catch (Exception ex) {
+            try { ModEntry.LogDebug($"Input Patch Error: {ex}"); } catch {}
+        }
     }
 }
