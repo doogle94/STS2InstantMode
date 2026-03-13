@@ -13,7 +13,8 @@ using Godot;
 using System;
 using System.IO;
 using System.Reflection;
-using System.Diagnostics;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace InstantMode;
 
@@ -24,6 +25,9 @@ public static class ModEntry
     private static bool _logCleared = false;
     public const float FastSpeed = 10.0f;
     public static bool IsEnabled = true;
+    
+    // Flag to track transitions without needing expensive StackTrace checks
+    public static bool IsTransitionActive = false;
 
     private static string GetLogPath()
     {
@@ -59,7 +63,7 @@ public static class ModEntry
         if (_initialized) return;
         _initialized = true;
 
-        LogDebug("Initializing InstantMode v1.3.2 (Performance Optimized)...");
+        LogDebug("v1.3.4 - STABLE FLAG-BASED TRANSITIONS (StackTrace Removed)");
 
         try {
             var harmony = new Harmony("com.instantmode.mod");
@@ -71,7 +75,7 @@ public static class ModEntry
             manager.Name = "InstantModeSpeedManager";
             NGame.Instance?.CallDeferred(Node.MethodName.AddChild, manager);
 
-            LogDebug("Init complete. StackTrace caching enabled.");
+            LogDebug("Init complete. Monitoring transitions via flags.");
         } catch (Exception ex) {
             LogDebug($"FATAL INIT ERROR: {ex}");
         }
@@ -87,7 +91,7 @@ public static class ModEntry
             var getter = fastModeProp.GetGetMethod();
             var prefix = AccessTools.Method(typeof(FastModeGetterPatch), nameof(FastModeGetterPatch.Prefix));
             harmony.Patch(getter, new HarmonyMethod(prefix));
-            LogDebug("FastMode StackTrace Patch Active.");
+            LogDebug("FastMode property patched.");
         } catch (Exception ex) {
             LogDebug($"Could not patch FastMode getter: {ex}");
         }
@@ -111,39 +115,12 @@ public static class ModEntry
 
 public static class FastModeGetterPatch
 {
-    private static long _lastCheckedFrame = -1;
-    private static bool _isTransitionCached = false;
-    private static int _callCountTotal = 0;
-
     public static bool Prefix(ref FastModeType __result)
     {
-        if (!ModEntry.IsEnabled) return true;
-
-        _callCountTotal++;
-        try {
-            // PERFORMANCE FIX: Only generate StackTrace once per frame.
-            // This reduces calls from ~10,000/sec to ~60/sec.
-            long currentFrame = (long)Engine.GetFramesDrawn();
-            
-            if (currentFrame != _lastCheckedFrame)
-            {
-                var stack = new StackTrace(false);
-                string stackStr = stack.ToString();
-                
-                _isTransitionCached = stackStr.Contains("NTransition") || 
-                                     stackStr.Contains("Fade") || 
-                                     stackStr.Contains("RoomFade") ||
-                                     stackStr.Contains("Transition");
-                
-                _lastCheckedFrame = currentFrame;
-
-                // Log transition start for debugging
-                if (_isTransitionCached) {
-                    ModEntry.LogDebug($"[TRACE] Transition detected at frame {currentFrame}.");
-                }
-            }
-
-            if (_isTransitionCached)
+        if (ModEntry.IsEnabled)
+        {
+            // Very fast check - no StackTrace overhead
+            if (ModEntry.IsTransitionActive)
             {
                 __result = FastModeType.Fast;
                 return false;
@@ -151,10 +128,8 @@ public static class FastModeGetterPatch
 
             __result = FastModeType.Instant;
             return false;
-        } catch (Exception ex) {
-            ModEntry.LogDebug($"GETTER ERROR: {ex.Message}");
-            return true; 
         }
+        return true;
     }
 }
 
@@ -173,9 +148,7 @@ public partial class SpeedManager : Node
             {
                 Engine.TimeScale = (double)ModEntry.FastSpeed;
             }
-        } catch (Exception ex) {
-            ModEntry.LogDebug($"SpeedManager Error: {ex}");
-        }
+        } catch {}
     }
 }
 
@@ -186,8 +159,10 @@ public static class TransitionPatch
     [HarmonyPrefix]
     static void FadeOutPrefix(ref float time)
     {
+        ModEntry.IsTransitionActive = true;
         if (ModEntry.IsEnabled)
         {
+            ModEntry.LogDebug($"[TRACE] FadeOut Started. Time set to 1.0 (0.1s real)");
             time = 1.0f; 
         }
     }
@@ -196,23 +171,60 @@ public static class TransitionPatch
     [HarmonyPrefix]
     static void FadeInPrefix(ref float time)
     {
+        ModEntry.IsTransitionActive = true;
         if (ModEntry.IsEnabled)
         {
             time = 1.0f;
         }
     }
+
+    [HarmonyPatch(nameof(NTransition.FadeIn))]
+    [HarmonyPostfix]
+    static void FadeInPostfix()
+    {
+        ModEntry.IsTransitionActive = false;
+        ModEntry.LogDebug("[TRACE] Transition Finished (FadeIn).");
+    }
+
+    [HarmonyPatch(nameof(NTransition.RoomFadeOut))]
+    [HarmonyPrefix]
+    static void RoomFadeOutPrefix()
+    {
+        ModEntry.IsTransitionActive = true;
+        ModEntry.LogDebug("[TRACE] RoomFadeOut Started.");
+    }
+
+    [HarmonyPatch(nameof(NTransition.RoomFadeIn))]
+    [HarmonyPostfix]
+    static void RoomFadeInPostfix()
+    {
+        ModEntry.IsTransitionActive = false;
+        ModEntry.LogDebug("[TRACE] RoomFadeIn Finished.");
+    }
 }
 
-[HarmonyPatch(typeof(Cmd), nameof(Cmd.Wait), new Type[] { typeof(float), typeof(bool) })]
+[HarmonyPatch(typeof(Cmd))]
 public static class CmdWaitPatch
 {
-    static bool Prefix(ref float seconds)
+    [HarmonyPatch(nameof(Cmd.Wait), new Type[] { typeof(float), typeof(bool) })]
+    [HarmonyPrefix]
+    static void Prefix1(ref float seconds)
     {
-        if (ModEntry.IsEnabled)
+        if (ModEntry.IsEnabled && seconds > 0f)
         {
-            seconds = 0f;
+            // Safety: Use 0.001 instead of 0 to prevent infinite loops in game scripts
+            seconds = 0.001f;
         }
-        return true;
+    }
+
+    [HarmonyPatch(nameof(Cmd.Wait), new Type[] { typeof(float), typeof(CancellationToken), typeof(bool) })]
+    [HarmonyPrefix]
+    static void Prefix2(ref float seconds)
+    {
+        if (ModEntry.IsEnabled && seconds > 0f)
+        {
+            seconds = 0.001f;
+        }
     }
 }
 
@@ -221,10 +233,12 @@ public static class TweenSpeedPatch
 {
     static void Postfix(Tween __result)
     {
-        if (ModEntry.IsEnabled && __result != null)
-        {
-            __result.SetSpeedScale(ModEntry.FastSpeed);
-        }
+        try {
+            if (ModEntry.IsEnabled && __result != null)
+            {
+                __result.SetSpeedScale(ModEntry.FastSpeed);
+            }
+        } catch {}
     }
 }
 
@@ -233,12 +247,14 @@ public static class InputPatch
 {
     static void Postfix(InputEvent inputEvent)
     {
-        if (inputEvent is InputEventKey keyEvent && keyEvent.Pressed && !keyEvent.IsEcho())
-        {
-            if (keyEvent.Keycode == Key.F8)
+        try {
+            if (inputEvent is InputEventKey keyEvent && keyEvent.Pressed && !keyEvent.IsEcho())
             {
-                ModEntry.Toggle();
+                if (keyEvent.Keycode == Key.F8)
+                {
+                    ModEntry.Toggle();
+                }
             }
-        }
+        } catch {}
     }
 }
