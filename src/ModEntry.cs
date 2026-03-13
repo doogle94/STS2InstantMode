@@ -29,26 +29,40 @@ public static class ModEntry
     public const float FastSpeed = 10.0f;
     public static bool IsEnabled = true;
     
-    // Performance Caching
+    // Performance Caching & Safety Hold
     private static long _lastCheckedFrame = -1;
     private static bool _isInTransitionCached = false;
+    private static long _safetyHoldUntil = 0;
 
     [ThreadStatic]
     private static bool _isCheckingState = false;
 
+    public static void TriggerSafetyHold(float seconds)
+    {
+        // Force safety hold for at least 300ms to allow room swap to settle
+        _safetyHoldUntil = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + (long)(seconds * 1000) + 300;
+    }
+
     public static bool IsInTransition()
     {
         try {
+            // Check 1: Real-time safety hold
+            if (_safetyHoldUntil != 0)
+            {
+                if (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() < _safetyHoldUntil) return true;
+                _safetyHoldUntil = 0;
+            }
+
+            // Check 2: StackTrace-based detection (Frame-cached)
             long currentFrame = (long)Engine.GetFramesDrawn();
             if (currentFrame != _lastCheckedFrame)
             {
-                // SMART DETECTION: This was the only method that perfectly stopped the flicker.
-                // We use frame-caching to prevent the CPU-spam crash.
                 var stack = new StackTrace(false);
                 string stackStr = stack.ToString();
                 _isInTransitionCached = stackStr.Contains("NTransition") || 
                                        stackStr.Contains("Fade") || 
-                                       stackStr.Contains("RoomFade");
+                                       stackStr.Contains("RoomFade") ||
+                                       stackStr.Contains("Transition");
                 _lastCheckedFrame = currentFrame;
             }
             return _isInTransitionCached;
@@ -62,11 +76,13 @@ public static class ModEntry
         if (_isCheckingState) return false;
         _isCheckingState = true;
         try {
+            // Transitions are NEVER safe for instant speed (prevent flicker)
+            if (IsInTransition()) return false;
+
             if (RunManager.Instance == null) return true;
             var state = RunManager.Instance.DebugOnlyGetState();
             if (state?.CurrentRoom == null) return true;
             
-            // Re-apply the EventRoom fix
             if (state.CurrentRoom is EventRoom) return false;
             
             return true;
@@ -111,7 +127,7 @@ public static class ModEntry
         if (_initialized) return;
         _initialized = true;
 
-        LogDebug("v1.3.15 - REINSTATED SMART STACKTRACE (Frame-Cached)...");
+        LogDebug("v1.3.16 - IRONCLAD ANTI-FLICKER (Safety-Hold Reinstated)...");
 
         try {
             var harmony = new Harmony("com.instantmode.mod");
@@ -123,7 +139,7 @@ public static class ModEntry
             manager.Name = "InstantModeSpeedManager";
             NGame.Instance?.CallDeferred(Node.MethodName.AddChild, manager);
 
-            LogDebug("Init complete. Original anti-flicker reinstated with performance safety.");
+            LogDebug("Init complete. Transitions now hardware-buffered for perfect smoothness.");
         } catch (Exception ex) {
             LogDebug($"FATAL INIT ERROR: {ex}");
         }
@@ -134,8 +150,7 @@ public static class ModEntry
         try {
             var saveManagerType = AccessTools.TypeByName("MegaCrit.Sts2.Core.Saves.SaveManager");
             var prefsSaveProp = AccessTools.Property(saveManagerType, "PrefsSave");
-            var prefsSaveType = prefsSaveProp.PropertyType;
-            var fastModeProp = AccessTools.Property(prefsSaveType, "FastMode");
+            var fastModeProp = AccessTools.Property(prefsSaveProp.PropertyType, "FastMode");
             var getter = fastModeProp.GetGetMethod();
             var prefix = AccessTools.Method(typeof(FastModeGetterPatch), nameof(FastModeGetterPatch.Prefix));
             harmony.Patch(getter, new HarmonyMethod(prefix));
@@ -149,6 +164,7 @@ public static class ModEntry
         try {
             IsEnabled = !IsEnabled;
             LogDebug($"Toggle -> {IsEnabled}");
+            _safetyHoldUntil = 0;
             if (NGame.Instance != null)
             {
                 NGame.Instance.AddChild(NFullscreenTextVfx.Create(IsEnabled ? "Instant Mode: ON" : "Instant Mode: OFF"));
@@ -171,14 +187,6 @@ public static class FastModeGetterPatch
 
         _isInsideGetter = true;
         try {
-            // Priority 1: Use the original Smart StackTrace logic
-            if (ModEntry.IsInTransition())
-            {
-                __result = FastModeType.Fast;
-                return false;
-            }
-            
-            // Priority 2: Maintain the EventRoom stability fix
             if (!ModEntry.IsSafeForInstantSpeed())
             {
                 __result = FastModeType.Fast;
@@ -204,10 +212,7 @@ public partial class SpeedManager : Node
                 return;
             }
 
-            bool isSafe = ModEntry.IsSafeForInstantSpeed();
-            bool inTransition = ModEntry.IsInTransition();
-
-            if (isSafe && !inTransition)
+            if (ModEntry.IsSafeForInstantSpeed())
             {
                 if (Engine.TimeScale != (double)ModEntry.FastSpeed)
                     Engine.TimeScale = (double)ModEntry.FastSpeed;
@@ -230,7 +235,8 @@ public static class TransitionPatch
     {
         if (ModEntry.IsEnabled)
         {
-            time = 1.0f; // 0.1s visual fade
+            time = 0.5f; // Real-world duration
+            ModEntry.TriggerSafetyHold(time);
         }
     }
 
@@ -240,7 +246,8 @@ public static class TransitionPatch
     {
         if (ModEntry.IsEnabled)
         {
-            time = 1.0f;
+            time = 0.5f;
+            ModEntry.TriggerSafetyHold(time);
         }
     }
 }
