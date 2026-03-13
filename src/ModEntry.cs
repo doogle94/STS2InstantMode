@@ -39,11 +39,11 @@ public static class ModEntry
         if (_isCheckingState) return false;
         _isCheckingState = true;
         try {
-            // ULTIMATE GROUND TRUTH: If the NTransition node exists and is visible, we ARE in a transition.
-            // This is perfectly synced with the game's actual screen state.
-            if (NTransition.Instance != null && !NTransition.Instance.IsQueuedForDeletion())
+            // ULTIMATE GROUND TRUTH: Direct access to the game's internal transition state.
+            // This is perfectly synced with the actual screen animations.
+            if (NGame.Instance?.Transition != null)
             {
-                return true;
+                if (NGame.Instance.Transition.InTransition) return true;
             }
 
             // FALLBACK: Timestamp-based expiry
@@ -65,14 +65,13 @@ public static class ModEntry
         if (_isCheckingState) return false;
         _isCheckingState = true;
         try {
-            // PROACTIVE CHECK 1: If the Godot Scene Tree has a CombatRoom, we are in combat.
+            // Check for combat room first (Proactive)
             if (NCombatRoom.Instance != null && !NCombatRoom.Instance.IsQueuedForDeletion()) 
             {
                 if (CombatManager.Instance != null && CombatManager.Instance.IsEnding) return false;
                 return true;
             }
 
-            // PROACTIVE CHECK 2: Standard Room Detection
             if (RunManager.Instance == null) return true;
             var state = RunManager.Instance.DebugOnlyGetState();
             if (state?.CurrentRoom == null) return true;
@@ -122,7 +121,7 @@ public static class ModEntry
         if (_initialized) return;
         _initialized = true;
 
-        LogDebug("v1.3.13 - SCENE-SYNCED ANTI-FLICKER (NTransition Detection)...");
+        LogDebug("v1.3.13 - SCENE-SYNCED ANTI-FLICKER (Transition.InTransition)...");
 
         try {
             var harmony = new Harmony("com.instantmode.mod");
@@ -134,7 +133,7 @@ public static class ModEntry
             manager.Name = "InstantModeSpeedManager";
             NGame.Instance?.CallDeferred(Node.MethodName.AddChild, manager);
 
-            LogDebug("Init complete. Flicker-prevention now visually synced.");
+            LogDebug("Init complete. Flicker-prevention now hardware synced.");
         } catch (Exception ex) {
             LogDebug($"FATAL INIT ERROR: {ex}");
         }
@@ -145,7 +144,8 @@ public static class ModEntry
         try {
             var saveManagerType = AccessTools.TypeByName("MegaCrit.Sts2.Core.Saves.SaveManager");
             var prefsSaveProp = AccessTools.Property(saveManagerType, "PrefsSave");
-            var fastModeProp = AccessTools.Property(prefsSaveProp.PropertyType, "FastMode");
+            var prefsSaveType = prefsSaveProp.PropertyType;
+            var fastModeProp = AccessTools.Property(prefsSaveType, "FastMode");
             var getter = fastModeProp.GetGetMethod();
             var prefix = AccessTools.Method(typeof(FastModeGetterPatch), nameof(FastModeGetterPatch.Prefix));
             harmony.Patch(getter, new HarmonyMethod(prefix));
