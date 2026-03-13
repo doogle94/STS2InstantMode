@@ -6,6 +6,8 @@ using MegaCrit.Sts2.Core.Runs;
 using MegaCrit.Sts2.Core.Combat;
 using MegaCrit.Sts2.Core.Commands;
 using MegaCrit.Sts2.Core.Settings;
+using MegaCrit.Sts2.Core.Rooms;
+using MegaCrit.Sts2.Core.Nodes.Rooms;
 using MegaCrit.Sts2.Core.Nodes.CommonUi;
 using MegaCrit.Sts2.Core.Nodes.Vfx;
 using MegaCrit.Sts2.Core.Extensions;
@@ -29,6 +31,9 @@ public static class ModEntry
     public static long TransitionStartedAt = 0;
     public const long TransitionExpiryMs = 2000;
 
+    [ThreadStatic]
+    private static bool _isCheckingState = false;
+
     public static bool IsInTransition()
     {
         if (TransitionStartedAt == 0) return false;
@@ -39,6 +44,37 @@ public static class ModEntry
             return false;
         }
         return true;
+    }
+
+    public static bool IsSafeForInstantSpeed()
+    {
+        if (_isCheckingState) return false;
+        _isCheckingState = true;
+        try {
+            // PROACTIVE CHECK 1: If the Godot Scene Tree has a CombatRoom, we are in combat.
+            // This is much faster and more reactive than waiting for RunManager state to update.
+            if (NCombatRoom.Instance != null && !NCombatRoom.Instance.IsQueuedForDeletion()) 
+            {
+                if (CombatManager.Instance != null && CombatManager.Instance.IsEnding) return false;
+                return true;
+            }
+
+            // PROACTIVE CHECK 2: Standard Room Detection
+            if (RunManager.Instance == null) return true;
+            var state = RunManager.Instance.DebugOnlyGetState();
+            if (state?.CurrentRoom == null) return true;
+            
+            var room = state.CurrentRoom;
+            
+            // Explicitly exclude only EventRoom
+            if (room is EventRoom) return false;
+            
+            return true;
+        } catch {
+            return true; 
+        } finally {
+            _isCheckingState = false;
+        }
     }
 
     private static string GetLogPath()
@@ -75,7 +111,7 @@ public static class ModEntry
         if (_initialized) return;
         _initialized = true;
 
-        LogDebug("v1.3.6 - FORENSIC DEBUGGING START...");
+        LogDebug("v1.3.12 - REACTIVE SCENE-BASED SPEED (Fixed Room-Entry Lag)...");
 
         try {
             var harmony = new Harmony("com.instantmode.mod");
@@ -87,7 +123,7 @@ public static class ModEntry
             manager.Name = "InstantModeSpeedManager";
             NGame.Instance?.CallDeferred(Node.MethodName.AddChild, manager);
 
-            LogDebug("Init complete. Monitoring State, Cmds, and Tweens.");
+            LogDebug("Init complete. Speed will now kick in immediately on Combat load.");
         } catch (Exception ex) {
             LogDebug($"FATAL INIT ERROR: {ex}");
         }
@@ -140,6 +176,13 @@ public static class FastModeGetterPatch
                 __result = FastModeType.Fast;
                 return false;
             }
+            
+            if (!ModEntry.IsSafeForInstantSpeed())
+            {
+                __result = FastModeType.Fast;
+                return false;
+            }
+
             __result = FastModeType.Instant;
             return false;
         } finally {
@@ -150,27 +193,34 @@ public static class FastModeGetterPatch
 
 public partial class SpeedManager : Node
 {
-    private int _heartbeatCounter = 0;
+    private bool _lastState = false;
 
     public override void _Process(double delta)
     {
         try {
-            _heartbeatCounter++;
-            if (_heartbeatCounter >= 120) { // Every 2 seconds
-                long mem = (long)Performance.GetMonitor(Performance.Monitor.MemoryStatic);
-                // ModEntry.LogDebug($"[HEARTBEAT] Frame: {Engine.GetFramesDrawn()}, Mem: {mem / 1024 / 1024}MB, InTransition: {ModEntry.IsInTransition()}");
-                _heartbeatCounter = 0;
-            }
-
             if (!ModEntry.IsEnabled)
             {
                 if (Engine.TimeScale != 1.0) Engine.TimeScale = 1.0;
                 return;
             }
 
-            if (Engine.TimeScale != (double)ModEntry.FastSpeed)
+            bool isSafe = ModEntry.IsSafeForInstantSpeed();
+            bool inTransition = ModEntry.IsInTransition();
+
+            if (isSafe != _lastState) {
+                // ModEntry.LogDebug($"[SPEED] Safe state changed: {isSafe}");
+                _lastState = isSafe;
+            }
+
+            if (isSafe && !inTransition)
             {
-                Engine.TimeScale = (double)ModEntry.FastSpeed;
+                if (Engine.TimeScale != (double)ModEntry.FastSpeed)
+                    Engine.TimeScale = (double)ModEntry.FastSpeed;
+            }
+            else
+            {
+                if (Engine.TimeScale != 1.0)
+                    Engine.TimeScale = 1.0;
             }
         } catch {}
     }
@@ -186,7 +236,6 @@ public static class TransitionPatch
         ModEntry.TransitionStartedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         if (ModEntry.IsEnabled)
         {
-            ModEntry.LogDebug($"[STATE] Transition START (FadeOut). Dur: {time}");
             time = 1.0f; 
         }
     }
@@ -196,7 +245,6 @@ public static class TransitionPatch
     static void FadeInPostfix()
     {
         ModEntry.TransitionStartedAt = 0;
-        ModEntry.LogDebug("[STATE] Transition END (FadeIn).");
     }
 }
 
@@ -209,7 +257,6 @@ public static class CmdWaitPatch
     {
         if (ModEntry.IsEnabled && seconds > 0f)
         {
-            // ModEntry.LogDebug($"[CMD] Wait bypassing: {seconds}s");
             seconds = 0.01f;
         }
     }
@@ -220,21 +267,9 @@ public static class CmdWaitPatch
     {
         if (ModEntry.IsEnabled)
         {
-            // ModEntry.LogDebug($"[CMD] CustomWait bypassing: {fastSeconds}s / {standardSeconds}s");
             fastSeconds = 0.01f;
             standardSeconds = 0.01f;
         }
-    }
-}
-
-[HarmonyPatch(typeof(NGame))]
-public static class NGamePatch
-{
-    [HarmonyPatch("LoadRun")]
-    [HarmonyPrefix]
-    static void LoadRunPrefix()
-    {
-        ModEntry.LogDebug("[STATE] NGame.LoadRun called - Major transition starting.");
     }
 }
 
@@ -246,7 +281,10 @@ public static class TweenSpeedPatch
         try {
             if (ModEntry.IsEnabled && __result != null)
             {
-                __result.SetSpeedScale(ModEntry.FastSpeed);
+                if (ModEntry.IsSafeForInstantSpeed())
+                {
+                    __result.SetSpeedScale(ModEntry.FastSpeed);
+                }
             }
         } catch {}
     }
@@ -265,8 +303,6 @@ public static class InputPatch
                     ModEntry.Toggle();
                 }
             }
-        } catch (Exception ex) {
-            try { ModEntry.LogDebug($"Input Patch Error: {ex}"); } catch {}
-        }
+        } catch {}
     }
 }
