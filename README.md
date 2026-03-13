@@ -1,17 +1,25 @@
 # Instant Mode for Slay the Spire 2
 
-A mod for **Slay the Spire 2** which increases the speed of almost everything to be practically instant.
+A high-performance game acceleration mod for **Slay the Spire 2**, designed to eliminate downtime and provide a near-instantaneous gameplay experience.
+
+## Features
+
+- **10x Game Speed**: Globally accelerates animations and game logic via `Engine.TimeScale`.
+- **Zero-Latency Actions**: Forces `Instant` mode and patches `Cmd.Wait` to eliminate logical delays.
+- **Persistent Speed**: Uses a background manager to ensure the speed multiplier stays active across scene changes.
+- **In-Game Toggle**: Toggle the mod on/off instantly with **F8**, featuring an on-screen notification.
 
 ## Controls
 
-- **F8**: Toggle Instant Mode On/Off. A notice will appear with the current status.
+- **F8**: Toggle Instant Mode On/Off.
 
 ## Installation
 
 1. Ensure you have a mod loader installed for Slay the Spire 2.
-2. Download the latest `InstantMode.zip` and extract it.
-3. Place the `InstantMode.dll` and `InstantMode.pck` files in `<Game install path>\Slay the Spire 2\mods\InstantMode\` (Create the mods & InstantMode folders if necessary)
-4. Launch the game and accept using mods if you haven't previously.
+2. Download the latest `InstantMode.dll` and `InstantMode.pck`.
+3. Place both files in your game's mod directory:
+   `...\SteamLibrary\steamapps\common\Slay the Spire 2\mods\InstantMode\`
+4. Launch the game and enjoy the speed!
 
 ## How it Works (Technical)
 
@@ -22,9 +30,5 @@ This mod performs surgical patches using **Harmony**:
 3. **Command Overrides**: Divides all remaining wait times by the speed multiplier to ensure consistent performance.
 4. **VFX Notifications**: Uses the game's internal `NFullscreenTextVfx` for toggle feedback.
 
-## Credits
-
-- This mod was built using the [sts2_ExampleMod](https://github.com/customjack/sts2_ExampleMod) template by **customjack**.
-
 ---
-*Created with AI because I'm lazy*
+*Created by dukelukem53*
