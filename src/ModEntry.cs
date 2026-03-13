@@ -11,8 +11,10 @@ using MegaCrit.Sts2.Core.Nodes.Vfx;
 using MegaCrit.Sts2.Core.Extensions;
 using Godot;
 using System;
+using System.IO;
 using System.Reflection;
-using System.Diagnostics;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace InstantMode;
 
@@ -20,15 +22,45 @@ namespace InstantMode;
 public static class ModEntry
 {
     private static bool _initialized = false;
+    private static bool _logCleared = false;
     public const float FastSpeed = 10.0f;
     public static bool IsEnabled = true;
+
+    private static string GetLogPath()
+    {
+        try {
+            string assemblyPath = Assembly.GetExecutingAssembly().Location;
+            string modDir = Path.GetDirectoryName(assemblyPath);
+            return Path.Combine(modDir, "instant_mode_debug.log");
+        } catch {
+            return "instant_mode_debug.log";
+        }
+    }
+
+    public static void LogDebug(string msg)
+    {
+        string path = GetLogPath();
+        string timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff");
+        string fullMsg = $"[{timestamp}] {msg}";
+        
+        Log.Warn($"[InstantMode] {msg}");
+
+        try {
+            if (!_logCleared) {
+                File.WriteAllText(path, fullMsg + System.Environment.NewLine);
+                _logCleared = true;
+            } else {
+                File.AppendAllText(path, fullMsg + System.Environment.NewLine);
+            }
+        } catch {}
+    }
 
     public static void Init()
     {
         if (_initialized) return;
         _initialized = true;
 
-        Log.Warn("[InstantMode] Initializing with Smart FastMode (Anti-Flicker)...");
+        LogDebug("Initializing InstantMode (Stable Version)...");
 
         try {
             var harmony = new Harmony("com.instantmode.mod");
@@ -40,9 +72,9 @@ public static class ModEntry
             manager.Name = "InstantModeSpeedManager";
             NGame.Instance?.CallDeferred(Node.MethodName.AddChild, manager);
 
-            Log.Warn("[InstantMode] Initialized. F8: Toggle Instant Mode.");
+            LogDebug("Init complete. F8 to toggle.");
         } catch (Exception ex) {
-            Log.Error($"[InstantMode] FATAL INIT ERROR: {ex}");
+            LogDebug($"FATAL INIT ERROR: {ex}");
         }
     }
 
@@ -56,21 +88,24 @@ public static class ModEntry
             var getter = fastModeProp.GetGetMethod();
             var prefix = AccessTools.Method(typeof(FastModeGetterPatch), nameof(FastModeGetterPatch.Prefix));
             harmony.Patch(getter, new HarmonyMethod(prefix));
+            LogDebug("FastMode property getter patched to return 'Fast'.");
         } catch (Exception ex) {
-            Log.Warn($"[InstantMode] Could not patch FastMode getter: {ex.Message}");
+            LogDebug($"Could not patch FastMode getter: {ex}");
         }
     }
 
     public static void Toggle()
     {
-        IsEnabled = !IsEnabled;
-        Log.Warn($"[InstantMode] Toggle -> {IsEnabled}");
-        
-        if (NGame.Instance != null)
-        {
-            try {
+        try {
+            IsEnabled = !IsEnabled;
+            LogDebug($"Toggle -> {IsEnabled}");
+            
+            if (NGame.Instance != null)
+            {
                 NGame.Instance.AddChild(NFullscreenTextVfx.Create(IsEnabled ? "Instant Mode: ON" : "Instant Mode: OFF"));
-            } catch {}
+            }
+        } catch (Exception ex) {
+            LogDebug($"Error during toggle: {ex}");
         }
     }
 }
@@ -81,16 +116,9 @@ public static class FastModeGetterPatch
     {
         if (ModEntry.IsEnabled)
         {
-            // Detect if we are in a transition or fade to prevent the "jump" flicker
-            var stack = new StackTrace();
-            string stackStr = stack.ToString();
-            if (stackStr.Contains("NTransition") || stackStr.Contains("Fade") || stackStr.Contains("RoomFade"))
-            {
-                __result = FastModeType.Fast;
-                return false;
-            }
-
-            __result = FastModeType.Instant;
+            // We return 'Fast' globally. This ensures Transitions play (avoiding flicker).
+            // We use our Cmd.Wait patch to make logical waits actually instant.
+            __result = FastModeType.Fast;
             return false;
         }
         return true;
@@ -101,16 +129,18 @@ public partial class SpeedManager : Node
 {
     public override void _Process(double delta)
     {
-        if (!ModEntry.IsEnabled)
-        {
-            if (Engine.TimeScale != 1.0) Engine.TimeScale = 1.0;
-            return;
-        }
+        try {
+            if (!ModEntry.IsEnabled)
+            {
+                if (Engine.TimeScale != 1.0) Engine.TimeScale = 1.0;
+                return;
+            }
 
-        if (Engine.TimeScale != (double)ModEntry.FastSpeed)
-        {
-            Engine.TimeScale = (double)ModEntry.FastSpeed;
-        }
+            if (Engine.TimeScale != (double)ModEntry.FastSpeed)
+            {
+                Engine.TimeScale = (double)ModEntry.FastSpeed;
+            }
+        } catch {}
     }
 }
 
@@ -123,8 +153,7 @@ public static class TransitionPatch
     {
         if (ModEntry.IsEnabled)
         {
-            // 1.0s / 10x speed = 0.1s visual snap.
-            time = 1.0f; 
+            time = 1.0f; // 0.1s visual
         }
     }
 
@@ -134,19 +163,34 @@ public static class TransitionPatch
     {
         if (ModEntry.IsEnabled)
         {
-            time = 1.0f;
+            time = 1.0f; // 0.1s visual
         }
     }
 }
 
-[HarmonyPatch(typeof(Cmd), nameof(Cmd.Wait), new Type[] { typeof(float), typeof(bool) })]
+[HarmonyPatch(typeof(Cmd))]
 public static class CmdWaitPatch
 {
-    static bool Prefix(ref float seconds)
+    [HarmonyPatch(nameof(Cmd.Wait), new Type[] { typeof(float), typeof(bool) })]
+    [HarmonyPrefix]
+    static bool Prefix1(ref Task __result)
     {
         if (ModEntry.IsEnabled)
         {
-            seconds = 0f;
+            __result = Task.CompletedTask;
+            return false;
+        }
+        return true;
+    }
+
+    [HarmonyPatch(nameof(Cmd.Wait), new Type[] { typeof(float), typeof(CancellationToken), typeof(bool) })]
+    [HarmonyPrefix]
+    static bool Prefix2(ref Task __result)
+    {
+        if (ModEntry.IsEnabled)
+        {
+            __result = Task.CompletedTask;
+            return false;
         }
         return true;
     }
@@ -157,10 +201,12 @@ public static class TweenSpeedPatch
 {
     static void Postfix(Tween __result)
     {
-        if (ModEntry.IsEnabled && __result != null)
-        {
-            __result.SetSpeedScale(ModEntry.FastSpeed);
-        }
+        try {
+            if (ModEntry.IsEnabled && __result != null)
+            {
+                __result.SetSpeedScale(ModEntry.FastSpeed);
+            }
+        } catch {}
     }
 }
 
@@ -169,12 +215,14 @@ public static class InputPatch
 {
     static void Postfix(InputEvent inputEvent)
     {
-        if (inputEvent is InputEventKey keyEvent && keyEvent.Pressed && !keyEvent.IsEcho())
-        {
-            if (keyEvent.Keycode == Key.F8)
+        try {
+            if (inputEvent is InputEventKey keyEvent && keyEvent.Pressed && !keyEvent.IsEcho())
             {
-                ModEntry.Toggle();
+                if (keyEvent.Keycode == Key.F8)
+                {
+                    ModEntry.Toggle();
+                }
             }
-        }
+        } catch {}
     }
 }
