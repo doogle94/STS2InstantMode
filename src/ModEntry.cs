@@ -59,7 +59,7 @@ public static class ModEntry
         if (_initialized) return;
         _initialized = true;
 
-        LogDebug("REVERTING TO SMART-FASTMODE + INTENSE LOGGING...");
+        LogDebug("Initializing InstantMode v1.3.2 (Performance Optimized)...");
 
         try {
             var harmony = new Harmony("com.instantmode.mod");
@@ -71,7 +71,7 @@ public static class ModEntry
             manager.Name = "InstantModeSpeedManager";
             NGame.Instance?.CallDeferred(Node.MethodName.AddChild, manager);
 
-            LogDebug("Init complete. Monitoring StackTrace behavior.");
+            LogDebug("Init complete. StackTrace caching enabled.");
         } catch (Exception ex) {
             LogDebug($"FATAL INIT ERROR: {ex}");
         }
@@ -111,40 +111,48 @@ public static class ModEntry
 
 public static class FastModeGetterPatch
 {
-    private static int _callCount = 0;
+    private static long _lastCheckedFrame = -1;
+    private static bool _isTransitionCached = false;
+    private static int _callCountTotal = 0;
 
     public static bool Prefix(ref FastModeType __result)
     {
         if (!ModEntry.IsEnabled) return true;
 
-        _callCount++;
+        _callCountTotal++;
         try {
-            var stack = new StackTrace(false); // Reduced overhead slightly by disabling file info
-            string stackStr = stack.ToString();
+            // PERFORMANCE FIX: Only generate StackTrace once per frame.
+            // This reduces calls from ~10,000/sec to ~60/sec.
+            long currentFrame = (long)Engine.GetFramesDrawn();
             
-            bool isTransition = stackStr.Contains("NTransition") || 
-                               stackStr.Contains("Fade") || 
-                               stackStr.Contains("RoomFade") ||
-                               stackStr.Contains("Transition");
-
-            if (isTransition)
+            if (currentFrame != _lastCheckedFrame)
             {
-                // We log every transition-triggered request to see if it causes loops
-                ModEntry.LogDebug($"[TRACE] Transition detected in Stack (Call #{_callCount}). Returning Fast.");
-                __result = FastModeType.Fast;
-                return false;
+                var stack = new StackTrace(false);
+                string stackStr = stack.ToString();
+                
+                _isTransitionCached = stackStr.Contains("NTransition") || 
+                                     stackStr.Contains("Fade") || 
+                                     stackStr.Contains("RoomFade") ||
+                                     stackStr.Contains("Transition");
+                
+                _lastCheckedFrame = currentFrame;
+
+                // Log transition start for debugging
+                if (_isTransitionCached) {
+                    ModEntry.LogDebug($"[TRACE] Transition detected at frame {currentFrame}.");
+                }
             }
 
-            // Periodically log standard calls to prove the getter is still alive
-            if (_callCount % 100 == 0) {
-                ModEntry.LogDebug($"[TRACE] Still alive. Getter call count: {_callCount}");
+            if (_isTransitionCached)
+            {
+                __result = FastModeType.Fast;
+                return false;
             }
 
             __result = FastModeType.Instant;
             return false;
         } catch (Exception ex) {
-            // If the StackTrace itself crashes (e.g. recursion), we catch it here
-            ModEntry.LogDebug($"CRITICAL STACKTRACE ERROR: {ex.Message}");
+            ModEntry.LogDebug($"GETTER ERROR: {ex.Message}");
             return true; 
         }
     }
@@ -152,15 +160,8 @@ public static class FastModeGetterPatch
 
 public partial class SpeedManager : Node
 {
-    private int _frames = 0;
-
     public override void _Process(double delta)
     {
-        _frames++;
-        if (_frames % 120 == 0) {
-            // ModEntry.LogDebug($"[TRACE] SpeedManager heartbeat (Frame {_frames})");
-        }
-
         try {
             if (!ModEntry.IsEnabled)
             {
@@ -173,7 +174,7 @@ public partial class SpeedManager : Node
                 Engine.TimeScale = (double)ModEntry.FastSpeed;
             }
         } catch (Exception ex) {
-            ModEntry.LogDebug($"SpeedManager Process Error: {ex}");
+            ModEntry.LogDebug($"SpeedManager Error: {ex}");
         }
     }
 }
@@ -183,21 +184,21 @@ public static class TransitionPatch
 {
     [HarmonyPatch(nameof(NTransition.FadeOut))]
     [HarmonyPrefix]
-    static void FadeOutPrefix(float time)
+    static void FadeOutPrefix(ref float time)
     {
         if (ModEntry.IsEnabled)
         {
-            ModEntry.LogDebug($"[TRACE] NTransition.FadeOut called. Target time: {time}");
+            time = 1.0f; 
         }
     }
 
     [HarmonyPatch(nameof(NTransition.FadeIn))]
     [HarmonyPrefix]
-    static void FadeInPrefix(float time)
+    static void FadeInPrefix(ref float time)
     {
         if (ModEntry.IsEnabled)
         {
-            ModEntry.LogDebug($"[TRACE] NTransition.FadeIn called. Target time: {time}");
+            time = 1.0f;
         }
     }
 }
@@ -205,15 +206,13 @@ public static class TransitionPatch
 [HarmonyPatch(typeof(Cmd), nameof(Cmd.Wait), new Type[] { typeof(float), typeof(bool) })]
 public static class CmdWaitPatch
 {
-    static bool Prefix(float seconds)
+    static bool Prefix(ref float seconds)
     {
         if (ModEntry.IsEnabled)
         {
-            if (seconds > 0.1f) {
-                // ModEntry.LogDebug($"[TRACE] Cmd.Wait(float, bool) bypassing {seconds}s wait.");
-            }
+            seconds = 0f;
         }
-        return true; // We let the original run because FastMode=Instant handles it
+        return true;
     }
 }
 
@@ -224,7 +223,6 @@ public static class TweenSpeedPatch
     {
         if (ModEntry.IsEnabled && __result != null)
         {
-            // ModEntry.LogDebug("[TRACE] Tween.SetParallel patched.");
             __result.SetSpeedScale(ModEntry.FastSpeed);
         }
     }
