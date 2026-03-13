@@ -61,7 +61,7 @@ public static class ModEntry
         if (_initialized) return;
         _initialized = true;
 
-        LogDebug("v1.3.22 - FORENSIC BASELINE LOGGING START...");
+        LogDebug("v1.3.24 - Stability Fix (Quit-to-Menu)...");
 
         try {
             var harmony = new Harmony("com.instantmode.mod");
@@ -73,7 +73,7 @@ public static class ModEntry
             manager.Name = "InstantModeSpeedManager";
             NGame.Instance?.CallDeferred(Node.MethodName.AddChild, manager);
 
-            LogDebug("Init complete. Monitoring event chain.");
+            LogDebug("Init complete.");
         } catch (Exception ex) {
             LogDebug($"FATAL INIT ERROR: {ex}");
         }
@@ -91,6 +91,17 @@ public static class ModEntry
             harmony.Patch(getter, new HarmonyMethod(prefix));
         } catch (Exception ex) {
             LogDebug($"Could not patch FastMode getter: {ex}");
+        }
+    }
+
+    public static bool IsInTransition()
+    {
+        try {
+            var stack = new StackTrace();
+            string stackStr = stack.ToString();
+            return stackStr.Contains("NTransition") || stackStr.Contains("Fade") || stackStr.Contains("RoomFade");
+        } catch {
+            return false;
         }
     }
 
@@ -142,10 +153,7 @@ public static class FastModeGetterPatch
     {
         if (ModEntry.IsEnabled)
         {
-            var stack = new StackTrace();
-            string stackStr = stack.ToString();
-            
-            if (stackStr.Contains("NTransition") || stackStr.Contains("Fade") || stackStr.Contains("RoomFade"))
+            if (ModEntry.IsInTransition())
             {
                 __result = FastModeType.Fast;
                 return false;
@@ -166,8 +174,6 @@ public static class FastModeGetterPatch
 
 public partial class SpeedManager : Node
 {
-    private int _frames = 0;
-
     public override void _Process(double delta)
     {
         if (!ModEntry.IsEnabled)
@@ -176,12 +182,10 @@ public partial class SpeedManager : Node
             return;
         }
 
-        bool isEvent = ModEntry.IsEventRoom();
-        
-        if (isEvent)
+        // Drop to 1.0x for Transitions AND EventRooms to ensure stability
+        if (ModEntry.IsEventRoom() || ModEntry.IsInTransition())
         {
             if (Engine.TimeScale != 1.0) {
-                ModEntry.LogDebug("[SPEED] Event detected. Dropping to 1.0x.");
                 Engine.TimeScale = 1.0;
             }
             return;
@@ -218,11 +222,6 @@ public static class TransitionPatch
             time = 1.0f;
         }
     }
-
-    // Helper for logging
-    private static string GetCurrentRoomName() {
-        try { return RunManager.Instance?.DebugOnlyGetState()?.CurrentRoom?.GetType().Name ?? "None"; } catch { return "Error"; }
-    }
 }
 
 [HarmonyPatch(typeof(Cmd), nameof(Cmd.Wait), new Type[] { typeof(float), typeof(bool) })]
@@ -232,10 +231,17 @@ public static class CmdWaitPatch
     {
         if (ModEntry.IsEnabled)
         {
-            if (ModEntry.IsEventRoom()) {
-                // Do NOT bypass waits in events - the game's state machine needs them.
+            // NEW STABILITY RULE: Never bypass waits during transitions.
+            // This prevents race conditions during "Quit to Menu" where async tasks 
+            // might still be running while the scene is being disposed.
+            if (ModEntry.IsInTransition()) {
                 return true; 
             }
+
+            if (ModEntry.IsEventRoom()) {
+                return true; 
+            }
+            
             seconds = 0f;
         }
         return true;
@@ -249,7 +255,7 @@ public static class TweenSpeedPatch
     {
         if (ModEntry.IsEnabled && __result != null)
         {
-            if (!ModEntry.IsEventRoom())
+            if (!ModEntry.IsEventRoom() && !ModEntry.IsInTransition())
             {
                 __result.SetSpeedScale(ModEntry.FastSpeed);
             }
